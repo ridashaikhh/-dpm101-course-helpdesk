@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DPM-101 Course Helpdesk</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main class="app">
+    <header class="top">
+      <div>
+        <h1>DPM-101 Course Helpdesk</h1>
+        <p class="sub">IIMBx · Digital Product Management — answers come only from the official course documents.</p>
+      </div>
+      <button id="newChat" class="ghost" type="button">New conversation</button>
+    </header>
+
+    <section class="counters" aria-label="Live usage counters">
+      <div class="counter"><span id="cTotal">0</span><label>Total questions asked</label></div>
+      <div class="counter"><span id="cApi">0</span><label>Gemini API calls made</label></div>
+      <div class="counter"><span id="cCache">0</span><label>Served from cache</label></div>
+    </section>
+
+    <section id="chat" class="chat" aria-live="polite">
+      <div class="msg bot"><div class="bubble">Hi! Ask me about DPM-101 grading, deadlines, exam rules or fees.</div></div>
+    </section>
+
+    <div class="examples" id="examples"></div>
+
+    <form id="form" class="composer" autocomplete="off">
+      <textarea id="input" rows="1" maxlength="500" placeholder="Type your question… (Enter to send, Shift+Enter for a new line)" aria-label="Your question"></textarea>
+      <button id="send" type="submit">Send</button>
+    </form>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

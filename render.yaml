@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: dpm101-helpdesk
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    # --factory: the app (and its SQLite DB) is created at startup, not at import time.
+    # Keep a single worker: in-flight de-duplication and rate limiting are per-process.
+    startCommand: uvicorn app.main:create_app --factory --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: GEMINI_API_KEY
+        sync: false            # set in the Render dashboard
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: DB_PATH
+        value: /tmp/helpdesk.db   # ephemeral on the free tier (see README)
