@@ -1,86 +1,175 @@
-# DPM-101 Course Helpdesk Chatbot
+# IIMBx DPM-101 Course Helpdesk Chatbot
 
-A small FastAPI app that answers student questions about the IIMBx *Digital Product Management (DPM-101)* course
-using only the supplied documents in `course_docs/`. Built for exam-week load: repeated questions are served from a
-SQLite-backed cache, duplicate clicks are collapsed, and Gemini failures never crash the page.
+> **Live Demo:** [https://dpm101-helpdesk-msdb.onrender.com](https://dpm101-helpdesk-msdb.onrender.com)
 
-**Stack:** Python · FastAPI · vanilla HTML/CSS/JS · Gemini API (REST via `httpx`) · SQLite · pytest · Render
+A lightweight, deployable FastAPI helpdesk chatbot built for the IIMBx *Digital Product Management (DPM-101)* course. The application is designed to answer student queries during high-traffic exam periods strictly using the four supplied course documents in `course_docs/`, while providing resilient caching, duplicate suppression, concurrency protection, and zero-crash error handling.
 
-## How it works
+**Tech Stack:** Python · FastAPI · Vanilla HTML/CSS/JavaScript · Google Gemini API (REST via `httpx`) · SQLite · pytest · Render
+
+---
+
+## Architecture & Request Flow
 
 ```
-browser ──POST /api/chat──▶ rate limit ▶ idempotency (request_id) ▶ cache lookup ▶ single-flight ▶ Gemini
-                                                                     (exact → FAQ)                  │
-                                   SQLite: answer_cache + counters ◀── store only successful answers┘
+Client Browser
+   │
+   ▼
+[ Rate Limiter ] ───▶ Per-IP sliding-window limiter (30 req/min)
+   │
+   ▼
+[ Idempotency Guard ] ───▶ Deduplicates repeat clicks via request_id (120s TTL)
+   │
+   ▼
+[ Caching Layer ] ───────▶ 1. Exact match (normalized text hash)
+   │                       2. Safe FAQ intent match (strict concept & vocabulary match)
+   │
+   ├──▶ Cache Hit ───────▶ Served instantly from SQLite (answer_cache)
+   │
+   ▼ Cache Miss
+[ Single-Flight Coalescer ] ──▶ Merges identical concurrent in-flight requests
+   │
+   ▼
+[ Concurrency Semaphore ] ───▶ Caps parallel Gemini API calls (default: 4)
+   │
+   ▼
+[ Gemini 2.5 Flash REST API ] ──▶ Temperature 0, structured JSON output
+   │
+   ▼
+[ SQLite Storage ] ──────▶ Saves validated answers to cache & updates atomic counters
 ```
 
-### Document quirks (handled in code, `.txt` files are never edited)
-| Quirk | Handling (`app/documents.py`) |
+---
+
+## Key Features & Document Handling
+
+The application handles internal document quirks dynamically in Python code without modifying the raw `.txt` files:
+
+| Quirk / Requirement | Solution & Implementation (`app/`) |
 |---|---|
-| Two grading policies (50% in v1, 60% + 40% exam minimum in v2) | v2 states it *supersedes* `02_grading_policy_v1.txt` and is newer → v1 is marked superseded and **not sent to the model**. Detected from the text, not hard-coded. |
-| Unmoderated forum export in `04_exam_rules_and_faq.txt`, including a comment pretending to be a system update ("exam is open-book, moved to 30 Dec") | Everything from the "UNMODERATED STUDENT DISCUSSION" header onward is cut before prompting; it is only scanned for injection patterns (reported at `/api/docs`). The system prompt additionally tells the model to treat documents as data and ignore embedded instructions. |
-| Topics not in the docs (refund process, SQL/Kubernetes, cricket) | The model must set `covered=false` and say *"This is not mentioned in the course documents."* Sources are validated against real file names. |
+| **Conflicting Grading Policies** | `03_grading_policy_v2.txt` declares that it supersedes `02_grading_policy_v1.txt`. `app/documents.py` detects this claim and verifies dates (`05 Oct 2026 > 10 Jan 2026`), excluding v1 completely from the context sent to Gemini. |
+| **Untrusted Student Forum Content** | Section 3 of `04_exam_rules_and_faq.txt` contains unmoderated forum posts and a simulated prompt injection. `_split_untrusted()` cuts off all content from the untrusted heading onward. |
+| **Prompt Injection Defense** | Layer 1 cuts untrusted content before prompt generation. Layer 2 enforces system prompt Rule 2: documents are treated strictly as data, never as executable instructions. |
+| **Strict Out-of-Scope Fallback** | Uncovered topics (e.g., refunds, SQL/Kubernetes, cricket) return `covered: false` and the exact standard notice: *"This is not mentioned in the course documents."* |
+| **Conservative 2-Tier Caching** | **Exact:** Case, whitespace, and punctuation-normalized hash.<br>**FAQ:** Intent concept matches with strict closed-vocabulary checking. Any query with extra numbers, dates, or altered constraints (e.g., "1 day late", "50%", "two quizzes") bypasses the FAQ cache. |
+| **Follow-up Context Isolation** | Follow-up questions in an ongoing conversation use conversation history but are never written to or read from the shared FAQ cache. |
+| **Concurrency & Single-Flight** | Frontend disables submit during in-flight requests. Backend idempotency checks `request_id`, and `_inflight` coalesces concurrent identical questions into a single Gemini call. |
+| **Safe Error Handling** | 429, 5xx, and timeout responses are retried once with backoff. Exhausted failures return friendly JSON error responses with proper HTTP status codes. Transient errors are never cached. |
+| **Concurrency-Safe SQLite** | Single connection guarded by `threading.RLock`, WAL journal mode, and `BEGIN IMMEDIATE` transactions for atomic writes and counter updates. |
 
-### Caching (conservative on purpose)
-1. **Exact layer** – key = hash of the normalized question (case, punctuation, whitespace, `1,500`, `dpm-101` spelling) + document/prompt version.
-2. **FAQ layer** (`app/normalizer.py`) – a paraphrase reuses a cached answer only if it contains the intent's required concepts **and every other content word is inside that intent's vocabulary**. Any extra number, date, unit or condition ("1 day late", "50%", "drop in week 2", "two quizzes") breaks the match and the question goes through the exact layer / Gemini instead. FAQ intents are always asked to Gemini in canonical wording so the cached answer doesn't depend on who asked first.
-3. **Follow-ups** (short or pronoun-based questions in an existing conversation, e.g. "what about the capstone?") use conversation history and are **never** read from or written to the shared cache.
-4. Errors, rate-limits and timeouts are **never cached**. The cache is invalidated automatically when document content or the prompt version changes.
+---
 
-### Concurrency & duplicate protection
-- Frontend: Send/Enter disabled while a request is pending; every submission carries a fresh `request_id`.
-- Backend idempotency: the same `request_id` returns the original result (no second call, counted once).
-- Single-flight: identical in-flight questions share one Gemini call (counted as cache hits, `coalesced`).
-- A semaphore caps simultaneous Gemini calls (`GEMINI_MAX_CONCURRENCY`); per-IP sliding-window limit on `/api/chat`.
-- SQLite: one shared connection, `RLock`, every write in `BEGIN IMMEDIATE` transactions, WAL mode.
+## API Endpoints
 
-### Error handling
-429 / 5xx / timeouts are retried once (honouring `Retry-After`, max 5 s), then the user sees a friendly message
-(HTTP 429/503/504/502 with `status: "error"`). Missing/invalid API key → friendly "not configured" message with no
-Gemini call. The API key lives only in env vars and is sent in a header, never logged or put in URLs.
+- `GET /` — Responsive web chat interface with live counters.
+- `POST /api/chat` — Main conversation endpoint. Accepts `{"question": "...", "conversation_id": "...", "request_id": "..."}`.
+- `GET /api/stats` — Real-time performance metrics (total questions, API calls, cache hits, hit rate, latency, suppressed duplicates).
+- `GET /api/docs` — Summary of loaded, active, and superseded course documents.
+- `GET /health` — Health check endpoint reporting service, database, and document status.
 
-### Counters
-`/api/stats` and the live panel show **Total questions**, **Gemini API calls** (each HTTP attempt, retries included) and
-**Served from cache** (exact + FAQ + coalesced), plus errors, hit rate, average latency, duplicates suppressed, and rate-limited requests.
+---
 
-## Endpoints
-`GET /` UI · `POST /api/chat` · `GET /api/stats` · `GET /api/docs` (which docs are used/excluded) · `GET /health`
+## Environment Variables
 
-`POST /api/chat` body: `{"question": "...", "conversation_id": "optional", "request_id": "optional-unique-id"}`
+Configure these settings in `.env` (local) or your hosting environment. **Never commit actual API keys or secrets to version control.**
 
-## Run locally
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements-dev.txt
-cp .env.example .env      # then put your key in GEMINI_API_KEY (or export it)
-export $(grep -v '^#' .env | xargs)
-uvicorn app.main:create_app --factory --reload
-# open http://localhost:8000
-python scripts/run_sample_questions.py        # optional: run the 12 sample questions
-```
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `GEMINI_API_KEY` | **Yes** | `""` | Google Gemini API key. Missing keys yield a friendly 503 response instead of crashing. |
+| `GEMINI_MODEL` | No | `gemini-2.5-flash` | Gemini model identifier. |
+| `GEMINI_THINKING_BUDGET` | No | `0` | Thinking token budget (`0` turns thinking off for minimum latency). |
+| `GEMINI_TIMEOUT_S` | No | `15.0` | HTTP request timeout in seconds. |
+| `GEMINI_MAX_RETRIES` | No | `1` | Retry attempts for transient 429/5xx status codes and timeouts. |
+| `GEMINI_MAX_CONCURRENCY` | No | `4` | Maximum parallel in-flight requests to the Gemini API. |
+| `DB_PATH` | No | `./data/helpdesk.db` | Filesystem path for the SQLite database. |
+| `RATE_LIMIT_PER_MIN` | No | `30` | Maximum requests per minute per client IP for `/api/chat`. |
 
-## Tests
+---
+
+## Local Setup & Execution
+
+### Prerequisites
+- Python 3.10 to 3.14
+- Google Gemini API key
+
+### Installation Steps
+
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/ridashaikhh/-dpm101-course-helpdesk.git
+   cd ./-dpm101-course-helpdesk
+   ```
+
+2. **Create and activate a virtual environment:**
+   - **Linux / macOS:**
+     ```bash
+     python -m venv .venv
+     source .venv/bin/activate
+     ```
+   - **Windows (PowerShell):**
+     ```powershell
+     python -m venv .venv
+     .\.venv\Scripts\Activate.ps1
+     ```
+
+3. **Install dependencies:**
+   ```bash
+   pip install -r requirements-dev.txt
+   ```
+
+4. **Configure environment:**
+   ```bash
+   cp .env.example .env
+   # Edit .env and paste your GEMINI_API_KEY
+   ```
+
+5. **Start the application:**
+   ```bash
+   uvicorn app.main:create_app --factory --reload --host 127.0.0.1 --port 8000
+   ```
+   Open `http://localhost:8000` in your browser.
+
+6. **Run sample test questions (optional):**
+   ```bash
+   python scripts/run_sample_questions.py
+   ```
+
+---
+
+## Automated Tests
+
+The test suite covers document parsing, conflict resolution, prompt injection stripping, normalization, exact/FAQ caching, request deduplication, concurrency coalescing, Gemini error handling, and API endpoints using mocked transports (no external network or API key required):
+
 ```bash
 pytest
 ```
-Tests use a fake Gemini client / mocked HTTP transport (no network, no API key): document handling, normalization and
-no-merge guards, caching, paraphrase reuse, concurrency, idempotency, error handling, persistence, Gemini client retries/parsing, and API endpoints.
 
-## Deploy on Render
-1. Push this repo to GitHub. 2. Render → *New → Blueprint* (uses `render.yaml`) or a Web Service with
-build `pip install -r requirements.txt` and start `uvicorn app.main:create_app --factory --host 0.0.0.0 --port $PORT --workers 1`.
-3. Set `GEMINI_API_KEY` in the dashboard. 4. Health check path: `/health`.
+All 53 unit and integration tests execute and pass in under 5 seconds.
 
-> **Render free tier filesystem is ephemeral.** The SQLite file (cache + counters) can be lost on restart, redeploy or
-> spin-down; the free tier also sleeps after inactivity, so the first request can be slow. The app recreates an empty DB
-> automatically and simply re-warms the cache. For durable data use a paid instance with a persistent disk and set `DB_PATH`
-> to a path on it (e.g. `/var/data/helpdesk.db`).
+---
 
-## Known limitations
-- Run a single worker/instance: single-flight, idempotency and conversation memory are in-process (cache + counters are in SQLite).
-- Conversation memory is in-process too; it resets on restart.
-- The FAQ vocabulary is hand-curated for the supplied docs; unknown paraphrases fall back to a (correct) Gemini call rather than risking a wrong merge.
-- Gemini answers are validated structurally (JSON, known source files) but not fact-checked beyond the prompt rules.
+## Render Deployment
 
-## AI sessions
-Exported AI session transcripts go in `ai_sessions/` (required by the assignment).
+The repository includes a `render.yaml` blueprint configured for Render's Web Service:
+
+1. Push your repository to GitHub.
+2. In the Render Dashboard, click **New → Blueprint** and link the repository (or create a **Web Service** manually).
+3. **Build Command:** `pip install -r requirements.txt`
+4. **Start Command:** `uvicorn app.main:create_app --factory --host 0.0.0.0 --port $PORT --workers 1`
+5. **Health Check Path:** `/health`
+6. Add `GEMINI_API_KEY` under Environment Variables in the Render dashboard.
+
+---
+
+## Important Constraints & Limitations
+
+- **Ephemeral Filesystem on Render Free Tier:** Render free tier instances use an ephemeral filesystem. The SQLite database (`/tmp/helpdesk.db`), including cached answers and counters, resets whenever the free instance spins down, sleeps after 15 minutes of inactivity, or redeploys. The application automatically re-creates an empty database and initialized counters on startup, and answers are cached on-demand as questions are asked (automatic cache pre-warming is not implemented). For durable storage, attach a persistent disk on a paid tier or point `DB_PATH` to persistent storage.
+- **Single-Worker Process:** In-process concurrency mechanisms (request deduplication, single-flight coalescing, per-IP rate limiting, and conversational turn history) reside in memory. The service must run with `--workers 1`.
+- **In-Memory Conversation History:** Follow-up conversation context is stored in memory and resets on server restart.
+- **Hand-Curated FAQ Vocabulary:** The FAQ paraphrase normalizer uses a strict vocabulary subset curated specifically for DPM-101 course topics. Unrecognized paraphrases safely fall through to Gemini and exact caching to prevent false merges.
+
+---
+
+## AI Development Session Log
+
+The exported AI session transcript documenting the prompts and responses used during development is located at:
+- [ai_sessions/claude-development-session.md](ai_sessions/claude-development-session.md)
